@@ -53,6 +53,17 @@ function VideoPlayer({ streamUrl }) {
       console.log('Attempting to join room:', roomId);
       socketRef.current.emit('join-room', { roomId, userId: socketRef.current.id }, (response) => {
         console.log('Join room response:', response);
+        // Check if stream is already active when joining
+        if (response && response.isStreamActive) {
+          console.log('Stream is already active when joining');
+          setIsStreamActive(true);
+          setStreamSource(response.streamSource);
+          if (response.streamSource === 'webcam') {
+            initializeWebRTC();
+          } else if (response.streamSource === 'obs') {
+            loadHLSStream();
+          }
+        }
       });
     });
 
@@ -109,8 +120,8 @@ function VideoPlayer({ streamUrl }) {
 
     // WebRTC signaling handlers
     socketRef.current.on('webrtc_offer', (data) => {
+      console.log('Received WebRTC offer:', data);
       if (peerConnectionRef.current) {
-        console.log('Received WebRTC offer');
         peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data.sdp))
           .then(() => {
             console.log('Remote description set with offer');
@@ -124,7 +135,8 @@ function VideoPlayer({ streamUrl }) {
             console.log('Sending WebRTC answer');
             socketRef.current.emit('webrtc_answer', {
               roomId,
-              sdp: peerConnectionRef.current.localDescription
+              sdp: peerConnectionRef.current.localDescription,
+              broadcasterId: data.broadcasterId
             });
           })
           .catch(err => console.error('Error handling WebRTC offer:', err));
@@ -132,16 +144,14 @@ function VideoPlayer({ streamUrl }) {
     });
 
     socketRef.current.on('webrtc_ice_candidate', (data) => {
-      console.log('Received ICE candidate from server');
-      if (peerConnectionRef.current) {
-        if (peerConnectionRef.current.remoteDescription) {
-          console.log('Adding ICE candidate immediately');
-          peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data.candidate))
-            .catch(err => console.error('Error adding ICE candidate:', err));
-        } else {
-          console.log('Storing ICE candidate for later');
-          setPendingCandidates(prev => [...prev, data.candidate]);
-        }
+      console.log('Received ICE candidate from server:', data);
+      if (peerConnectionRef.current && peerConnectionRef.current.remoteDescription) {
+        peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data.candidate))
+          .then(() => console.log('ICE candidate added from server'))
+          .catch(err => console.error('Error adding ICE candidate:', err));
+      } else {
+        console.log('Storing ICE candidate for later');
+        setPendingCandidates(prev => [...prev, data.candidate]);
       }
     });
     
@@ -249,7 +259,7 @@ function VideoPlayer({ streamUrl }) {
   };
 
   const initializeWebRTC = () => {
-    console.log('Initializing WebRTC');
+    console.log('Initializing WebRTC for viewer');
     const configuration = {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -258,14 +268,44 @@ function VideoPlayer({ streamUrl }) {
     };
 
     peerConnectionRef.current = new RTCPeerConnection(configuration);
-    console.log('Peer connection created');
+    console.log('Peer connection created for viewer');
     
     // Handle incoming tracks
     peerConnectionRef.current.ontrack = (event) => {
-      console.log('Received track from WebRTC');
-      if (videoRef.current) {
-        videoRef.current.srcObject = event.streams[0];
+      console.log('Received track from WebRTC:', event.track.kind);
+      if (videoRef.current && event.streams[0]) {
+        console.log('Setting video source object with received stream');
+        const stream = event.streams[0];
+        videoRef.current.srcObject = stream;
+        
+        // Ensure video plays automatically
+        videoRef.current.onloadedmetadata = () => {
+          console.log('Video metadata loaded, attempting to play');
+          videoRef.current.play()
+            .then(() => {
+              console.log('Video playback started successfully');
+              setIsStreamActive(true);
+            })
+            .catch(err => {
+              console.error('Error playing video:', err);
+              setError('Error playing video. Please try refreshing the page.');
+            });
+        };
       }
+    };
+
+    // Handle connection state changes
+    peerConnectionRef.current.onconnectionstatechange = () => {
+      console.log('Connection state changed:', peerConnectionRef.current.connectionState);
+      if (peerConnectionRef.current.connectionState === 'failed') {
+        console.error('WebRTC connection failed');
+        setError('Connection failed. Please try refreshing the page.');
+      }
+    };
+
+    // Handle ICE connection state changes
+    peerConnectionRef.current.oniceconnectionstatechange = () => {
+      console.log('ICE connection state:', peerConnectionRef.current.iceConnectionState);
     };
 
     // Handle ICE candidates
@@ -278,6 +318,44 @@ function VideoPlayer({ streamUrl }) {
         });
       }
     };
+
+    // Listen for WebRTC offer from broadcaster
+    socketRef.current.on('webrtc_offer', (data) => {
+      console.log('Received WebRTC offer:', data);
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data.sdp))
+          .then(() => {
+            console.log('Remote description set with offer');
+            return peerConnectionRef.current.createAnswer();
+          })
+          .then(answer => {
+            console.log('Created answer');
+            return peerConnectionRef.current.setLocalDescription(answer);
+          })
+          .then(() => {
+            console.log('Sending WebRTC answer');
+            socketRef.current.emit('webrtc_answer', {
+              roomId,
+              sdp: peerConnectionRef.current.localDescription,
+              broadcasterId: data.broadcasterId
+            });
+          })
+          .catch(err => console.error('Error handling WebRTC offer:', err));
+      }
+    });
+
+    // Listen for ICE candidates from broadcaster
+    socketRef.current.on('webrtc_ice_candidate', (data) => {
+      console.log('Received ICE candidate from server:', data);
+      if (peerConnectionRef.current && peerConnectionRef.current.remoteDescription) {
+        peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data.candidate))
+          .then(() => console.log('ICE candidate added from server'))
+          .catch(err => console.error('Error adding ICE candidate:', err));
+      } else {
+        console.log('Storing ICE candidate for later');
+        setPendingCandidates(prev => [...prev, data.candidate]);
+      }
+    });
 
     // Apply any pending ICE candidates
     pendingCandidates.forEach(candidate => {
@@ -304,6 +382,9 @@ function VideoPlayer({ streamUrl }) {
       ) : null}
       <video
         ref={videoRef}
+        autoPlay
+        playsInline
+        muted={false}
         controls
         className="w-full h-48 bg-black rounded-lg"
       />

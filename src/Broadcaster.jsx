@@ -188,6 +188,8 @@ function Broadcaster({ roomId }) {
   };
 
   const startWebRTCStream = (stream) => {
+    console.log('Starting WebRTC stream with tracks:', stream.getTracks().map(t => t.kind));
+    
     // WebRTC configuration - adjust ICE servers as needed
     const configuration = {
       iceServers: [
@@ -199,7 +201,9 @@ function Broadcaster({ roomId }) {
 
     // Add stream tracks to peer connection
     stream.getTracks().forEach(track => {
-      peerConnectionRef.current.addTrack(track, stream);
+      console.log('Adding track to peer connection:', track.kind);
+      const sender = peerConnectionRef.current.addTrack(track, stream);
+      console.log('Track added successfully:', sender);
     });
 
     // Handle ICE candidates and send to server
@@ -218,6 +222,7 @@ function Broadcaster({ roomId }) {
       offerToReceiveAudio: false,
       offerToReceiveVideo: false
     }).then(offer => {
+      console.log('Created WebRTC offer:', offer);
       return peerConnectionRef.current.setLocalDescription(offer);
     }).then(() => {
       console.log('Sending WebRTC offer to server:', peerConnectionRef.current.localDescription);
@@ -232,8 +237,13 @@ function Broadcaster({ roomId }) {
     // Listen for answer from server
     socketRef.current.on('webrtc_answer', (data) => {
       if (peerConnectionRef.current) {
+        console.log('Received WebRTC answer from server:', data);
         peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data.sdp))
-          .then(() => console.log('Remote description set with answer from server'))
+          .then(() => {
+            console.log('Remote description set with answer from server');
+            // Notify that stream has started
+            socketRef.current.emit('stream_started', { roomId, source: 'webcam' });
+          })
           .catch(err => console.error('Error setting remote description:', err));
       }
     });
@@ -241,6 +251,7 @@ function Broadcaster({ roomId }) {
     // Listen for ICE candidates from server
     socketRef.current.on('webrtc_ice_candidate', (data) => {
       if (peerConnectionRef.current) {
+        console.log('Received ICE candidate from server:', data);
         peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data.candidate))
           .then(() => console.log('ICE candidate added from server'))
           .catch(err => console.error('Error adding ICE candidate:', err));
