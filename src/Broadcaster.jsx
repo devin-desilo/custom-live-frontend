@@ -4,24 +4,50 @@ import Hls from 'hls.js';
 
 const createSocket = (roomId) => {
   const token = `temp_${Math.random().toString(36).substring(2, 15)}`;
-  return io('http://localhost:5000', {
-    query: { token },
+  console.log('Creating broadcaster socket with token:', token);
+  const socket = io('http://localhost:5000', {
+    query: { token, roomId },
     auth: { token },
     autoConnect: false,
+    transports: ['websocket', 'polling'],
+    reconnection: true,
+    reconnectionAttempts: 5,
+    reconnectionDelay: 1000
   });
+
+  // Add connection event listeners
+  socket.on('connect', () => {
+    console.log('Broadcaster socket connected successfully');
+  });
+
+  socket.on('connect_error', (error) => {
+    console.error('Broadcaster socket connection error:', error);
+  });
+
+  socket.on('disconnect', (reason) => {
+    console.log('Broadcaster socket disconnected:', reason);
+  });
+
+  socket.on('error', (error) => {
+    console.error('Broadcaster socket error:', error);
+  });
+
+  return socket;
 };
 
 function Broadcaster({ roomId }) {
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const peerConnectionRef = useRef(null);
+  const viewerConnectionsRef = useRef(new Map()); // Store peer connections for each viewer
+  const pendingCandidatesRef = useRef(new Map()); // Store pending ICE candidates for each viewer
   const [isStreaming, setIsStreaming] = useState(false);
   const [isAudioEnabled, setIsAudioEnabled] = useState(true);
   const [isVideoEnabled, setIsVideoEnabled] = useState(true);
   const [streamSource, setStreamSource] = useState('webcam');
   const [availableCameras, setAvailableCameras] = useState([]);
   const [selectedCamera, setSelectedCamera] = useState('');
-  const hlsStreamUrl = `http://localhost:8080/hls/stream_${roomId}.m3u8`;
+  const hlsStreamUrl = `http://localhost:8020/live/stream_${roomId}/index.m3u8`;
   const socketRef = useRef(null);
 
   useEffect(() => {
@@ -83,105 +109,255 @@ function Broadcaster({ roomId }) {
   const startStreaming = async () => {
     if (streamSource === 'webcam') {
       try {
+        console.log('Requesting media devices...');
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { deviceId: selectedCamera ? { exact: selectedCamera } : undefined },
-          audio: true,
+          video: { 
+            deviceId: selectedCamera ? { exact: selectedCamera } : undefined,
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          },
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
         });
+        console.log('Media devices obtained:', {
+          videoTracks: stream.getVideoTracks().map(t => ({
+            id: t.id,
+            enabled: t.enabled,
+            muted: t.muted,
+            readyState: t.readyState,
+            settings: t.getSettings()
+          })),
+          audioTracks: stream.getAudioTracks().map(t => ({
+            id: t.id,
+            enabled: t.enabled,
+            muted: t.muted,
+            readyState: t.readyState,
+            settings: t.getSettings()
+          }))
+        });
+
         streamRef.current = stream;
         videoRef.current.srcObject = stream;
-        videoRef.current.play();
-        setIsStreaming(true);
-        console.log('Streaming webcam, tracks:', stream.getTracks().map(t => t.kind));
-        socketRef.current.emit('start_streaming', { roomId, source: 'webcam' });
-        startWebRTCStream(stream);
+        
+        // Add event listeners for the video element
+        videoRef.current.onloadedmetadata = () => {
+          console.log('Video metadata loaded');
+          videoRef.current.play()
+            .then(() => {
+              console.log('Video playback started successfully');
+              setIsStreaming(true);
+            })
+            .catch(err => {
+              console.error('Video play error:', err);
+            });
+        };
+
+        videoRef.current.onerror = (err) => {
+          console.error('Video element error:', err);
+        };
+
+        // First emit start_streaming event
+        console.log('Emitting start_streaming event...');
+        socketRef.current.emit('start_streaming', { roomId, source: 'webcam' }, (response) => {
+          console.log('Start streaming response:', response);
+          if (response?.success) {
+            console.log('Starting WebRTC after successful start_streaming');
+            startWebRTCStream(stream);
+          } else {
+            console.error('Failed to start streaming:', response?.error);
+            // Clean up if streaming failed to start
+            stream.getTracks().forEach(track => track.stop());
+            videoRef.current.srcObject = null;
+            streamRef.current = null;
+            setIsStreaming(false);
+          }
+        });
       } catch (err) {
         console.error('Error accessing media devices:', err);
       }
     } else if (streamSource === 'obs') {
-      setIsStreaming(true);
-      console.log('Streaming OBS');
-      socketRef.current.emit('start_streaming', { roomId, source: 'obs' });
+      console.log('Starting OBS stream for room:', roomId);
+      
+      // First emit start_streaming event
+      socketRef.current.emit('start_streaming', { roomId, source: 'obs' }, async (response) => {
+        console.log('Start streaming response:', response);
+        if (response?.success) {
+          setIsStreaming(true);
+          
+          // Start checking for HLS stream
+          const checkHLSStream = async () => {
+            try {
+              console.log('Checking HLS stream at:', hlsStreamUrl);
+              const response = await fetch(hlsStreamUrl);
+              if (response.ok) {
+                console.log('HLS stream is available');
+                if (videoRef.current) {
+                  if (Hls.isSupported()) {
+                    const hls = new Hls({ 
+                      enableWorker: true, 
+                      lowLatencyMode: true,
+                      debug: true,
+                      maxBufferLength: 30,
+                      maxMaxBufferLength: 60,
+                      maxBufferSize: 60 * 1000 * 1000,
+                      maxBufferHole: 0.5,
+                      backBufferLength: 90
+                    });
+                    hls.loadSource(hlsStreamUrl);
+                    hls.attachMedia(videoRef.current);
+                    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                      console.log('HLS manifest parsed for preview');
+                      videoRef.current.play();
+                    });
+                    hls.on(Hls.Events.ERROR, (event, data) => {
+                      console.error('HLS error in preview:', data);
+                      if (data.fatal) {
+                        hls.destroy();
+                        setIsStreaming(false);
+                      }
+                    });
+                  } else if (videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
+                    videoRef.current.src = hlsStreamUrl;
+                    videoRef.current.play();
+                  }
+                }
+              } else {
+                console.log('HLS stream not yet available, retrying in 2 seconds...');
+                setTimeout(checkHLSStream, 2000);
+              }
+            } catch (err) {
+              console.log('Error checking HLS stream:', err);
+              setTimeout(checkHLSStream, 2000);
+            }
+          };
+          
+          checkHLSStream();
+        } else {
+          console.error('Failed to start streaming:', response?.error);
+          setIsStreaming(false);
+        }
+      });
     }
   };
 
   const startWebRTCStream = (stream) => {
-    console.log('Starting WebRTC, tracks:', stream.getTracks());
+    console.log('Starting WebRTC stream with tracks:', stream.getTracks().map(t => ({
+      kind: t.kind,
+      enabled: t.enabled,
+      muted: t.muted,
+      readyState: t.readyState
+    })));
+
     const configuration = {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-        // Add TURN server for non-local testing
-        // { urls: 'turn:your.turn.server:3478', username: 'user', credential: 'pass' }
       ],
     };
-    peerConnectionRef.current = new RTCPeerConnection(configuration);
-    console.log('PeerConnection created, signalingState:', peerConnectionRef.current.signalingState);
 
+    peerConnectionRef.current = new RTCPeerConnection(configuration);
+    console.log('New peer connection created, signalingState:', peerConnectionRef.current.signalingState);
+
+    // Add tracks to peer connection
     stream.getTracks().forEach(track => {
-      console.log('Adding track:', track.kind, 'enabled:', track.enabled);
+      console.log('Adding track to peer connection:', {
+        kind: track.kind,
+        enabled: track.enabled,
+        muted: track.muted,
+        readyState: track.readyState
+      });
       peerConnectionRef.current.addTrack(track, stream);
     });
 
+    // Set up event handlers
     peerConnectionRef.current.onicecandidate = (event) => {
       if (event.candidate) {
-        console.log('Sending ICE candidate:', event.candidate);
-        socketRef.current.emit('webrtc_ice_candidate', { roomId, candidate: event.candidate });
-      } else {
-        console.log('ICE candidate gathering complete');
+        console.log('Sending ICE candidate to all viewers');
+        socketRef.current.emit('webrtc_ice_candidate', { 
+          roomId, 
+          candidate: event.candidate,
+          broadcasterId: socketRef.current.id
+        });
       }
     };
 
     peerConnectionRef.current.onconnectionstatechange = () => {
-      console.log('connectionState:', peerConnectionRef.current.connectionState);
+      console.log('WebRTC connection state changed:', peerConnectionRef.current.connectionState);
     };
 
     peerConnectionRef.current.oniceconnectionstatechange = () => {
-      console.log('iceConnectionState:', peerConnectionRef.current.iceConnectionState);
-      console.log('iceGatheringState:', peerConnectionRef.current.iceGatheringState);
+      console.log('ICE connection state:', peerConnectionRef.current.iceConnectionState);
     };
 
-    peerConnectionRef.current.onsignalingstatechange = () => {
-      console.log('signalingState:', peerConnectionRef.current.signalingState);
-    };
-
-    peerConnectionRef.current.ontrack = (event) => {
-      console.warn('Host received track (unexpected):', event.track.kind);
-    };
-
+    // Create and send offer
+    console.log('Creating WebRTC offer...');
     peerConnectionRef.current.createOffer({
       offerToReceiveAudio: false,
       offerToReceiveVideo: false,
     })
       .then(offer => {
-        console.log('Offer created:', offer.sdp.substring(0, 100) + '...');
+        console.log('Offer created:', {
+          type: offer.type,
+          sdp: offer.sdp.substring(0, 100) + '...'
+        });
         return peerConnectionRef.current.setLocalDescription(offer);
       })
       .then(() => {
-        console.log('Local description set, sending webrtc_offer');
+        console.log('Local description set, broadcasting webrtc_offer to room:', roomId);
+        const offer = peerConnectionRef.current.localDescription;
         socketRef.current.emit('webrtc_offer', {
           roomId,
-          sdp: peerConnectionRef.current.localDescription,
+          sdp: {
+            type: offer.type,
+            sdp: offer.sdp
+          },
+          broadcasterId: socketRef.current.id
         });
       })
-      .catch(err => console.error('Error creating offer:', err));
+      .catch(err => {
+        console.error('Error creating/setting offer:', err);
+      });
 
+    // Handle answers from viewers
     socketRef.current.on('webrtc_answer', (data) => {
-      console.log('Received webrtc_answer:', data);
+      console.log('Received webrtc_answer from viewer:', data);
       if (peerConnectionRef.current) {
         peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data.sdp))
           .then(() => {
-            console.log('Remote description set, signalingState:', peerConnectionRef.current.signalingState);
+            console.log('Remote description set for viewer:', data.broadcasterId);
+            // Apply any pending ICE candidates for this viewer
+            const pendingCandidates = pendingCandidatesRef.current.get(data.broadcasterId) || [];
+            console.log(`Applying ${pendingCandidates.length} pending ICE candidates for viewer:`, data.broadcasterId);
+            pendingCandidates.forEach(candidate => {
+              peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate))
+                .then(() => console.log('Pending ICE candidate added for viewer:', data.broadcasterId))
+                .catch(err => console.error('Error adding pending ICE candidate:', err));
+            });
+            pendingCandidatesRef.current.delete(data.broadcasterId);
           })
-          .catch(err => console.error('Error setting remote description:', err));
+          .catch(err => {
+            console.error('Error setting remote description for viewer:', err);
+          });
       }
     });
 
+    // Handle ICE candidates from viewers
     socketRef.current.on('webrtc_ice_candidate', (data) => {
-      console.log('Received ICE candidate:', data);
+      console.log('Received ICE candidate from viewer:', data);
       if (peerConnectionRef.current) {
-        peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data.candidate))
-          .then(() => console.log('ICE candidate added'))
-          .catch(err => console.error('Error adding ICE candidate:', err));
+        if (peerConnectionRef.current.remoteDescription) {
+          peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data.candidate))
+            .then(() => console.log('ICE candidate added for viewer'))
+            .catch(err => console.error('Error adding ICE candidate for viewer:', err));
+        } else {
+          console.log('Storing ICE candidate for later, remote description not set yet');
+          const pendingCandidates = pendingCandidatesRef.current.get(data.senderId) || [];
+          pendingCandidates.push(data.candidate);
+          pendingCandidatesRef.current.set(data.senderId, pendingCandidates);
+        }
       }
     });
   };
@@ -197,6 +373,9 @@ function Broadcaster({ roomId }) {
         peerConnectionRef.current.close();
         peerConnectionRef.current = null;
       }
+      // Clear all pending candidates
+      pendingCandidatesRef.current.clear();
+      
       setIsStreaming(false);
       console.log('Emitting stop_streaming');
       socketRef.current.emit('stop_streaming', roomId);
@@ -275,6 +454,20 @@ function Broadcaster({ roomId }) {
       socketRef.current.off('webrtc_answer');
       socketRef.current.off('webrtc_ice_candidate');
     };
+  }, []);
+
+  // Add socket event listeners for OBS stream status
+  useEffect(() => {
+    if (socketRef.current) {
+      socketRef.current.on('stream_status', (data) => {
+        console.log('Stream status update:', data);
+        if (data.isActive) {
+          setIsStreaming(true);
+        } else {
+          setIsStreaming(false);
+        }
+      });
+    }
   }, []);
 
   return (
