@@ -107,7 +107,30 @@ function App() {
       alert('Please enter a Room ID');
       return;
     }
+
     try {
+      console.log('Checking room status for:', joinRoomId);
+      const roomResponse = await fetch(`http://localhost:5000/room/${joinRoomId}`);
+      const roomData = await roomResponse.json();
+      console.log('Room data received:', roomData);
+
+      if (!roomResponse.ok) {
+        console.error('Room check failed:', roomData);
+        if (roomResponse.status === 404) {
+          alert('Room not found');
+        } else {
+          alert('Error checking room status');
+        }
+        return;
+      }
+
+      if (!roomData.isStreamActive) {
+        console.log('Stream not active, room data:', roomData);
+        alert('Cannot join room yet. Please wait for the host to start streaming.');
+        return;
+      }
+
+      console.log('Stream is active, proceeding with join...');
       const response = await fetch('http://localhost:5000/join-room', {
         method: 'POST',
         headers: {
@@ -115,17 +138,29 @@ function App() {
         },
         body: JSON.stringify({ roomId: joinRoomId, userId }),
       });
+
       const data = await response.json();
-      if (data.message === 'Joined room') {
-        setIsRoomJoined(true);
-        setRoomId(joinRoomId);
-        setHostId(data.hostId);
-        setRole('viewer');
-        window.history.pushState({}, '', `?role=viewer&room=${joinRoomId}`);
-        socket.emit('join-room', { roomId: joinRoomId, userId });
-      } else {
-        alert(data.message);
+      console.log('Join room response:', data);
+
+      if (!response.ok) {
+        console.error('Join room error:', data);
+        alert(data.message || 'Failed to join room');
+        return;
       }
+
+      if (!data.isStreamActive) {
+        console.log('Stream not active in join response:', data);
+        alert('Cannot join room yet. Please wait for the host to start streaming.');
+        return;
+      }
+
+      console.log('Successfully joining room:', data);
+      setIsRoomJoined(true);
+      setRoomId(joinRoomId);
+      setHostId(data.hostId);
+      setRole('viewer');
+      window.history.pushState({}, '', `?role=viewer&room=${joinRoomId}`);
+      socket.emit('join-room', { roomId: joinRoomId, userId });
     } catch (error) {
       console.error('Error joining room:', error);
       alert('Failed to join room');
@@ -167,6 +202,9 @@ function App() {
               Join Room (Viewer)
             </button>
           </div>
+          <p className="text-sm text-gray-600 mt-4">
+            Note: Viewers can only join after the host has started streaming.
+          </p>
         </div>
       </div>
     );
