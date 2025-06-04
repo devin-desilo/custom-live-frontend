@@ -1,69 +1,187 @@
 import React, { useRef, useEffect, useState } from 'react';
-import io from 'socket.io-client';
 import Hls from 'hls.js';
 
-const createSocket = (roomId) => {
-  const token = `temp_${Math.random().toString(36).substring(2, 15)}`;
-  console.log('Creating broadcaster socket with token:', token);
-  const socket = io('http://localhost:5000', {
-    query: { token, roomId },
-    auth: { token },
-    autoConnect: false,
-    transports: ['websocket', 'polling'],
-    reconnection: true,
-    reconnectionAttempts: 5,
-    reconnectionDelay: 1000
-  });
-
-  // Add connection event listeners
-  socket.on('connect', () => {
-    console.log('Broadcaster socket connected successfully');
-  });
-
-  socket.on('connect_error', (error) => {
-    console.error('Broadcaster socket connection error:', error);
-  });
-
-  socket.on('disconnect', (reason) => {
-    console.log('Broadcaster socket disconnected:', reason);
-  });
-
-  socket.on('error', (error) => {
-    console.error('Broadcaster socket error:', error);
-  });
-
-  return socket;
-};
-
-function Broadcaster({ roomId }) {
+function Broadcaster({ roomId, socket }) {
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const peerConnectionRef = useRef(null);
-  const viewerConnectionsRef = useRef(new Map()); // Store peer connections for each viewer
-  const pendingCandidatesRef = useRef(new Map()); // Store pending ICE candidates for each viewer
+  const peerConnectionsRef = useRef(new Map());
+  const pendingCandidatesRef = useRef(new Map());
   const [isStreaming, setIsStreaming] = useState(false);
   const [isAudioEnabled, setIsAudioEnabled] = useState(true);
   const [isVideoEnabled, setIsVideoEnabled] = useState(true);
   const [streamSource, setStreamSource] = useState('webcam');
   const [availableCameras, setAvailableCameras] = useState([]);
   const [selectedCamera, setSelectedCamera] = useState('');
+  const [isConnected, setIsConnected] = useState(false);
+  const [socketError, setSocketError] = useState(null);
   const hlsStreamUrl = `http://localhost:8020/live/stream_${roomId}/index.m3u8`;
-  const socketRef = useRef(null);
 
+  // Use the socket passed from App component
   useEffect(() => {
-    socketRef.current = createSocket(roomId);
-    socketRef.current.connect();
-    console.log('Broadcaster socket connected:', socketRef.current.id);
-    socketRef.current.emit('join-room', { roomId, userId: socketRef.current.id });
-    console.log('Broadcaster joined room:', roomId);
+    if (!socket) return;
+
+    const handleConnect = () => {
+      console.log('Broadcaster socket connected:', socket.id);
+      setIsConnected(true);
+      setSocketError(null);
+      
+      // Join room for broadcaster
+      socket.emit('join-room', { roomId, userId: socket.id }, (response) => {
+        console.log('Broadcaster join room response:', response);
+        if (!response?.success) {
+          console.error('Failed to join room as broadcaster:', response?.error);
+          setSocketError(response?.error || 'Failed to join room');
+        }
+      });
+    };
+
+    const handleDisconnect = () => {
+      console.log('Broadcaster socket disconnected');
+      setIsConnected(false);
+      setSocketError('Connection lost');
+    };
+
+    const handleConnectError = (error) => {
+      console.error('Broadcaster socket connection error:', error);
+      setSocketError('Connection error');
+      setIsConnected(false);
+    };
+
+    // Set up socket event listeners
+    if (socket.connected) {
+      handleConnect();
+    } else {
+      socket.on('connect', handleConnect);
+    }
+    
+    socket.on('disconnect', handleDisconnect);
+    socket.on('connect_error', handleConnectError);
 
     return () => {
-      if (socketRef.current) {
-        console.log('Broadcaster cleaning up socket');
-        socketRef.current.disconnect();
+      socket.off('connect', handleConnect);
+      socket.off('disconnect', handleDisconnect);
+      socket.off('connect_error', handleConnectError);
+    };
+  }, [socket, roomId]);
+
+  useEffect(() => {
+    if (!socket || !isConnected) return;
+
+    const cleanup = () => {
+      if (socket) {
+        try {
+          socket.off('viewer_joined');
+          socket.off('webrtc_answer');
+          socket.off('webrtc_ice_candidate');
+          socket.off('viewer_left');
+          socket.off('viewer_ready');
+          socket.off('get_stream_status');
+        } catch (err) {
+          console.warn('Error during socket cleanup:', err);
+        }
       }
     };
-  }, [roomId]);
+
+    socket.on('viewer_joined', (data) => {
+      console.log('New viewer joined:', data);
+      if (isStreaming && streamSource === 'webcam') {
+        console.log('Creating peer connection for new viewer:', data.viewerId);
+        // Handle viewer join synchronously
+        createPeerConnection(data.viewerId).catch(error => {
+          console.error('Error creating peer connection:', error);
+        });
+      }
+    });
+
+    socket.on('viewer_ready', (data) => {
+      console.log('Viewer ready event received:', data);
+      if (isStreaming && streamSource === 'webcam') {
+        console.log('Creating peer connection for ready viewer:', data.viewerId);
+        // Handle viewer ready synchronously
+        createPeerConnection(data.viewerId).catch(error => {
+          console.error('Error creating peer connection:', error);
+        });
+      } else {
+        console.log('Cannot create peer connection - streaming:', isStreaming, 'source:', streamSource);
+      }
+    });
+
+    socket.on('webrtc_answer', async (data) => {
+      console.log('Received answer from viewer:', data);
+      if (data.roomId !== roomId) return;
+      
+      const peerConnection = peerConnectionsRef.current.get(data.viewerId);
+      if (peerConnection) {
+        try {
+          console.log('Setting remote description from answer for viewer:', data.viewerId);
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+          console.log('Remote description set successfully');
+          
+          // Add any pending ICE candidates
+          const pendingCandidates = pendingCandidatesRef.current.get(data.viewerId) || [];
+          console.log('Adding pending ICE candidates for viewer:', data.viewerId, pendingCandidates.length);
+          for (const candidate of pendingCandidates) {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+          }
+          pendingCandidatesRef.current.delete(data.viewerId);
+        } catch (error) {
+          console.error('Error setting remote description:', error);
+        }
+      } else {
+        console.error('No peer connection found for viewer:', data.viewerId);
+      }
+    });
+
+    socket.on('webrtc_ice_candidate', async (data) => {
+      console.log('Received ICE candidate from viewer:', data);
+      if (data.roomId !== roomId) return;
+      
+      const viewerId = data.senderId;
+      const peerConnection = peerConnectionsRef.current.get(viewerId);
+      if (peerConnection) {
+        if (peerConnection.remoteDescription) {
+          try {
+            console.log('Adding ICE candidate for viewer:', viewerId);
+            await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+          } catch (error) {
+            console.error('Error adding ICE candidate:', error);
+          }
+        } else {
+          console.log('Storing ICE candidate for later, remote description not set yet');
+          const pendingCandidates = pendingCandidatesRef.current.get(viewerId) || [];
+          pendingCandidates.push(data.candidate);
+          pendingCandidatesRef.current.set(viewerId, pendingCandidates);
+        }
+      } else {
+        console.error('No peer connection found for viewer:', viewerId);
+      }
+    });
+
+    socket.on('viewer_left', (data) => {
+      console.log('Viewer left:', data);
+      const peerConnection = peerConnectionsRef.current.get(data.viewerId);
+      if (peerConnection) {
+        console.log('Closing peer connection for viewer:', data.viewerId);
+        peerConnection.close();
+        peerConnectionsRef.current.delete(data.viewerId);
+        pendingCandidatesRef.current.delete(data.viewerId);
+      }
+    });
+
+    // Handle get_stream_status requests
+    socket.on('get_stream_status', (data, callback) => {
+      console.log('Received stream status request from viewer:', data);
+      const status = {
+        isActive: isStreaming,
+        source: streamSource
+      };
+      console.log('Sending stream status response:', status);
+      callback(status);
+    });
+
+    return cleanup;
+  }, [socket, isStreaming, streamSource]);
 
   useEffect(() => {
     const getCameras = async () => {
@@ -106,260 +224,331 @@ function Broadcaster({ roomId }) {
     }
   }, [isStreaming, streamSource, hlsStreamUrl]);
 
+  const createPeerConnection = async (viewerId) => {
+    try {
+      console.log('Creating peer connection for viewer:', viewerId);
+      
+      // Temporarily disable connection limit for debugging
+      // // Limit WebRTC connections to first 3 viewers for performance
+      // const currentConnections = peerConnectionsRef.current.size;
+      // const MAX_WEBRTC_CONNECTIONS = 3;
+      
+      // if (currentConnections >= MAX_WEBRTC_CONNECTIONS) {
+      //   console.log(`Max WebRTC connections (${MAX_WEBRTC_CONNECTIONS}) reached. Viewer ${viewerId} will use HLS.`);
+      //   // Notify the viewer to use HLS instead
+      //   socket.emit('use_hls_fallback', {
+      //     roomId,
+      //     viewerId,
+      //     reason: 'max_webrtc_connections_reached'
+      //   });
+      //   return;
+      // }
+      
+      // Close existing connection for this viewer if it exists
+      if (peerConnectionsRef.current.has(viewerId)) {
+        const existingConnection = peerConnectionsRef.current.get(viewerId);
+        console.log('Closing existing connection for viewer:', viewerId);
+        existingConnection.close();
+        peerConnectionsRef.current.delete(viewerId);
+        pendingCandidatesRef.current.delete(viewerId);
+      }
+      
+      const peerConnection = new RTCPeerConnection({
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' }
+        ],
+        iceCandidatePoolSize: 10
+      });
+
+      // Store peer connection immediately
+      peerConnectionsRef.current.set(viewerId, peerConnection);
+      console.log(`WebRTC connections: ${peerConnectionsRef.current.size}`);
+
+      // Add local stream tracks to peer connection
+      if (streamRef.current) {
+        const tracks = streamRef.current.getTracks();
+        console.log('Available tracks to add:', tracks.map(t => ({ kind: t.kind, enabled: t.enabled, readyState: t.readyState })));
+        
+        tracks.forEach(track => {
+          console.log('Adding track to peer connection:', track.kind, 'enabled:', track.enabled, 'readyState:', track.readyState);
+          try {
+            const sender = peerConnection.addTrack(track, streamRef.current);
+            console.log('Track sender created:', sender);
+          } catch (err) {
+            console.error('Error adding track:', err);
+          }
+        });
+
+        // Log the transceivers after adding tracks
+        const transceivers = peerConnection.getTransceivers();
+        console.log('Peer connection transceivers:', transceivers.map(t => ({
+          kind: t.kind,
+          direction: t.direction,
+          currentDirection: t.currentDirection,
+          sender: !!t.sender,
+          receiver: !!t.receiver
+        })));
+      } else {
+        console.error('No local stream available for peer connection');
+        throw new Error('No local stream available');
+      }
+
+      // Handle ICE candidates
+      peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          console.log('Sending ICE candidate to viewer:', viewerId, 'candidate:', event.candidate.candidate);
+          socket.emit('webrtc_ice_candidate', {
+            roomId,
+            targetId: viewerId,
+            candidate: event.candidate,
+            isFromBroadcaster: true
+          });
+        } else {
+          console.log('ICE gathering complete for viewer:', viewerId);
+        }
+      };
+
+      // Handle connection state changes
+      peerConnection.onconnectionstatechange = () => {
+        const state = peerConnection.connectionState;
+        console.log(`Connection state for viewer ${viewerId}:`, state);
+        
+        switch (state) {
+          case 'connecting':
+            console.log(`Connecting to viewer ${viewerId}...`);
+            break;
+          case 'connected':
+            console.log(`Successfully connected to viewer ${viewerId}`);
+            // Verify tracks are still active
+            const senders = peerConnection.getSenders();
+            senders.forEach(sender => {
+              if (sender.track) {
+                console.log(`Track ${sender.track.kind} is ${sender.track.readyState} for viewer ${viewerId}`);
+              }
+            });
+            break;
+          case 'disconnected':
+            console.log(`Disconnected from viewer ${viewerId}, but connection may recover`);
+            // Don't immediately clean up - let it try to recover
+            setTimeout(() => {
+              if (peerConnection.connectionState === 'disconnected') {
+                console.log(`Connection to viewer ${viewerId} still disconnected after 10 seconds`);
+              }
+            }, 10000);
+            break;
+          case 'failed':
+            console.log(`Connection failed for viewer ${viewerId}, cleaning up`);
+            peerConnection.close();
+            peerConnectionsRef.current.delete(viewerId);
+            pendingCandidatesRef.current.delete(viewerId);
+            console.log(`WebRTC connections after cleanup: ${peerConnectionsRef.current.size}`);
+            break;
+          case 'closed':
+            console.log(`Connection closed for viewer ${viewerId}`);
+            peerConnectionsRef.current.delete(viewerId);
+            pendingCandidatesRef.current.delete(viewerId);
+            console.log(`WebRTC connections after cleanup: ${peerConnectionsRef.current.size}`);
+            break;
+        }
+      };
+
+      // Handle ICE connection state changes
+      peerConnection.oniceconnectionstatechange = () => {
+        const iceState = peerConnection.iceConnectionState;
+        console.log(`ICE connection state for viewer ${viewerId}:`, iceState);
+        
+        switch (iceState) {
+          case 'connected':
+          case 'completed':
+            console.log(`ICE connection established with viewer ${viewerId}`);
+            break;
+          case 'failed':
+            console.log(`ICE connection failed for viewer ${viewerId}, attempting restart`);
+            // Try ICE restart before giving up
+            try {
+              peerConnection.restartIce();
+            } catch (err) {
+              console.error('Error restarting ICE:', err);
+            }
+            break;
+          case 'disconnected':
+            console.log(`ICE disconnected for viewer ${viewerId}, may recover automatically`);
+            break;
+        }
+      };
+
+      // Create and send offer
+      console.log('Creating offer for viewer:', viewerId);
+      const offer = await peerConnection.createOffer({
+        offerToReceiveAudio: false,
+        offerToReceiveVideo: false
+      });
+      console.log('Created offer for viewer:', viewerId, 'offer type:', offer.type);
+      
+      await peerConnection.setLocalDescription(offer);
+      console.log('Set local description for viewer:', viewerId, 'state:', peerConnection.signalingState);
+      
+      console.log('Sending offer to viewer:', viewerId);
+      socket.emit('webrtc_offer', {
+        roomId,
+        viewerId,
+        offer: peerConnection.localDescription
+      });
+
+      console.log('Peer connection setup complete for viewer:', viewerId);
+    } catch (error) {
+      console.error('Error creating peer connection for viewer:', viewerId, error);
+      // Clean up on error
+      if (peerConnectionsRef.current.has(viewerId)) {
+        peerConnectionsRef.current.get(viewerId).close();
+        peerConnectionsRef.current.delete(viewerId);
+        pendingCandidatesRef.current.delete(viewerId);
+      }
+      throw error;
+    }
+  };
+
   const startStreaming = async () => {
-    if (streamSource === 'webcam') {
-      try {
-        console.log('Requesting media devices...');
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { 
+    try {
+      if (streamSource === 'webcam') {
+        const constraints = {
+          video: {
             deviceId: selectedCamera ? { exact: selectedCamera } : undefined,
             width: { ideal: 1280 },
             height: { ideal: 720 }
           },
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true
-          }
-        });
-        console.log('Media devices obtained:', {
-          videoTracks: stream.getVideoTracks().map(t => ({
-            id: t.id,
-            enabled: t.enabled,
-            muted: t.muted,
-            readyState: t.readyState,
-            settings: t.getSettings()
-          })),
-          audioTracks: stream.getAudioTracks().map(t => ({
-            id: t.id,
-            enabled: t.enabled,
-            muted: t.muted,
-            readyState: t.readyState,
-            settings: t.getSettings()
-          }))
-        });
+          audio: true
+        };
 
-        streamRef.current = stream;
-        videoRef.current.srcObject = stream;
+        console.log('Getting user media with constraints:', constraints);
+        streamRef.current = await navigator.mediaDevices.getUserMedia(constraints);
+        console.log('Got user media stream:', streamRef.current.getTracks().map(t => ({ kind: t.kind, enabled: t.enabled })));
         
-        // Add event listeners for the video element
-        videoRef.current.onloadedmetadata = () => {
-          console.log('Video metadata loaded');
-          videoRef.current.play()
-            .then(() => {
-              console.log('Video playback started successfully');
-              setIsStreaming(true);
-            })
-            .catch(err => {
-              console.error('Video play error:', err);
-            });
-        };
-
-        videoRef.current.onerror = (err) => {
-          console.error('Video element error:', err);
-        };
-
-        // First emit start_streaming event
-        console.log('Emitting start_streaming event...');
-        socketRef.current.emit('start_streaming', { roomId, source: 'webcam' }, (response) => {
-          console.log('Start streaming response:', response);
-          if (response?.success) {
-            console.log('Starting WebRTC after successful start_streaming');
-            startWebRTCStream(stream);
-          } else {
-            console.error('Failed to start streaming:', response?.error);
-            // Clean up if streaming failed to start
-            stream.getTracks().forEach(track => track.stop());
-            videoRef.current.srcObject = null;
-            streamRef.current = null;
+        // Monitor stream health
+        streamRef.current.getTracks().forEach(track => {
+          track.onended = () => {
+            console.error(`Broadcaster track ${track.kind} ended unexpectedly!`);
             setIsStreaming(false);
-          }
-        });
-      } catch (err) {
-        console.error('Error accessing media devices:', err);
-      }
-    } else if (streamSource === 'obs') {
-      console.log('Starting OBS stream for room:', roomId);
-      
-      // First emit start_streaming event
-      socketRef.current.emit('start_streaming', { roomId, source: 'obs' }, async (response) => {
-        console.log('Start streaming response:', response);
-        if (response?.success) {
-          setIsStreaming(true);
-          
-          // Start checking for HLS stream
-          const checkHLSStream = async () => {
-            try {
-              console.log('Checking HLS stream at:', hlsStreamUrl);
-              const response = await fetch(hlsStreamUrl);
-              if (response.ok) {
-                console.log('HLS stream is available');
-                if (videoRef.current) {
-                  if (Hls.isSupported()) {
-                    const hls = new Hls({ 
-                      enableWorker: true, 
-                      lowLatencyMode: true,
-                      debug: true,
-                      maxBufferLength: 30,
-                      maxMaxBufferLength: 60,
-                      maxBufferSize: 60 * 1000 * 1000,
-                      maxBufferHole: 0.5,
-                      backBufferLength: 90
-                    });
-                    hls.loadSource(hlsStreamUrl);
-                    hls.attachMedia(videoRef.current);
-                    hls.on(Hls.Events.MANIFEST_PARSED, () => {
-                      console.log('HLS manifest parsed for preview');
-                      videoRef.current.play();
-                    });
-                    hls.on(Hls.Events.ERROR, (event, data) => {
-                      console.error('HLS error in preview:', data);
-                      if (data.fatal) {
-                        hls.destroy();
-                        setIsStreaming(false);
-                      }
-                    });
-                  } else if (videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
-                    videoRef.current.src = hlsStreamUrl;
-                    videoRef.current.play();
-                  }
-                }
-              } else {
-                console.log('HLS stream not yet available, retrying in 2 seconds...');
-                setTimeout(checkHLSStream, 2000);
-              }
-            } catch (err) {
-              console.log('Error checking HLS stream:', err);
-              setTimeout(checkHLSStream, 2000);
-            }
+            alert(`${track.kind} track ended unexpectedly. Please restart streaming.`);
           };
           
-          checkHLSStream();
-        } else {
-          console.error('Failed to start streaming:', response?.error);
-          setIsStreaming(false);
+          track.onmute = () => {
+            console.warn(`Broadcaster track ${track.kind} muted`);
+          };
+          
+          track.onunmute = () => {
+            console.log(`Broadcaster track ${track.kind} unmuted`);
+          };
+        });
+        
+        if (videoRef.current) {
+          videoRef.current.srcObject = streamRef.current;
+          await videoRef.current.play();
         }
-      });
-    }
-  };
-
-  const startWebRTCStream = (stream) => {
-    console.log('Starting WebRTC stream with tracks:', stream.getTracks().map(t => ({
-      kind: t.kind,
-      enabled: t.enabled,
-      muted: t.muted,
-      readyState: t.readyState
-    })));
-
-    const configuration = {
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-      ],
-    };
-
-    peerConnectionRef.current = new RTCPeerConnection(configuration);
-    console.log('New peer connection created, signalingState:', peerConnectionRef.current.signalingState);
-
-    // Add tracks to peer connection
-    stream.getTracks().forEach(track => {
-      console.log('Adding track to peer connection:', {
-        kind: track.kind,
-        enabled: track.enabled,
-        muted: track.muted,
-        readyState: track.readyState
-      });
-      peerConnectionRef.current.addTrack(track, stream);
-    });
-
-    // Set up event handlers
-    peerConnectionRef.current.onicecandidate = (event) => {
-      if (event.candidate) {
-        console.log('Sending ICE candidate to all viewers');
-        socketRef.current.emit('webrtc_ice_candidate', { 
-          roomId, 
-          candidate: event.candidate,
-          broadcasterId: socketRef.current.id
-        });
-      }
-    };
-
-    peerConnectionRef.current.onconnectionstatechange = () => {
-      console.log('WebRTC connection state changed:', peerConnectionRef.current.connectionState);
-    };
-
-    peerConnectionRef.current.oniceconnectionstatechange = () => {
-      console.log('ICE connection state:', peerConnectionRef.current.iceConnectionState);
-    };
-
-    // Create and send offer
-    console.log('Creating WebRTC offer...');
-    peerConnectionRef.current.createOffer({
-      offerToReceiveAudio: false,
-      offerToReceiveVideo: false,
-    })
-      .then(offer => {
-        console.log('Offer created:', {
-          type: offer.type,
-          sdp: offer.sdp.substring(0, 100) + '...'
-        });
-        return peerConnectionRef.current.setLocalDescription(offer);
-      })
-      .then(() => {
-        console.log('Local description set, broadcasting webrtc_offer to room:', roomId);
-        const offer = peerConnectionRef.current.localDescription;
-        socketRef.current.emit('webrtc_offer', {
-          roomId,
-          sdp: {
-            type: offer.type,
-            sdp: offer.sdp
-          },
-          broadcasterId: socketRef.current.id
-        });
-      })
-      .catch(err => {
-        console.error('Error creating/setting offer:', err);
-      });
-
-    // Handle answers from viewers
-    socketRef.current.on('webrtc_answer', (data) => {
-      console.log('Received webrtc_answer from viewer:', data);
-      if (peerConnectionRef.current) {
-        peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data.sdp))
-          .then(() => {
-            console.log('Remote description set for viewer:', data.broadcasterId);
-            // Apply any pending ICE candidates for this viewer
-            const pendingCandidates = pendingCandidatesRef.current.get(data.broadcasterId) || [];
-            console.log(`Applying ${pendingCandidates.length} pending ICE candidates for viewer:`, data.broadcasterId);
-            pendingCandidates.forEach(candidate => {
-              peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate))
-                .then(() => console.log('Pending ICE candidate added for viewer:', data.broadcasterId))
-                .catch(err => console.error('Error adding pending ICE candidate:', err));
-            });
-            pendingCandidatesRef.current.delete(data.broadcasterId);
-          })
-          .catch(err => {
-            console.error('Error setting remote description for viewer:', err);
+        
+        // Emit start streaming event
+        console.log('Emitting start_streaming event');
+        await new Promise((resolve, reject) => {
+          socket.emit('start_streaming', { roomId, source: 'webcam' }, (response) => {
+            console.log('Start streaming response:', response);
+            if (response?.success) {
+              console.log('Stream started successfully');
+              setIsStreaming(true);
+              resolve(response);
+            } else {
+              console.error('Failed to start streaming:', response?.error);
+              reject(new Error(response?.error || 'Failed to start streaming'));
+            }
           });
-      }
-    });
+        });
 
-    // Handle ICE candidates from viewers
-    socketRef.current.on('webrtc_ice_candidate', (data) => {
-      console.log('Received ICE candidate from viewer:', data);
-      if (peerConnectionRef.current) {
-        if (peerConnectionRef.current.remoteDescription) {
-          peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data.candidate))
-            .then(() => console.log('ICE candidate added for viewer'))
-            .catch(err => console.error('Error adding ICE candidate for viewer:', err));
-        } else {
-          console.log('Storing ICE candidate for later, remote description not set yet');
-          const pendingCandidates = pendingCandidatesRef.current.get(data.senderId) || [];
-          pendingCandidates.push(data.candidate);
-          pendingCandidatesRef.current.set(data.senderId, pendingCandidates);
+        // Create peer connections for existing viewers
+        try {
+          console.log('Checking for existing viewers');
+          const roomData = await fetch(`http://localhost:5000/room/${roomId}`).then(res => res.json());
+          if (roomData.viewers && roomData.viewers.length > 0) {
+            console.log('Creating peer connections for existing viewers:', roomData.viewers);
+            for (const viewerId of roomData.viewers) {
+              await createPeerConnection(viewerId);
+            }
+          }
+        } catch (error) {
+          console.error('Error creating peer connections for existing viewers:', error);
         }
+      } else if (streamSource === 'obs') {
+        console.log('Starting OBS stream for room:', roomId);
+        
+        // First emit start_streaming event
+        console.log('Emitting start_streaming event for OBS');
+        await new Promise((resolve, reject) => {
+          socket.emit('start_streaming', { roomId, source: 'obs' }, (response) => {
+            console.log('Start streaming response:', response);
+            if (response?.success) {
+              console.log('OBS stream started successfully');
+              setIsStreaming(true);
+              resolve(response);
+            } else {
+              console.error('Failed to start OBS stream:', response?.error);
+              reject(new Error(response?.error || 'Failed to start streaming'));
+            }
+          });
+        });
+        
+        // Start checking for HLS stream
+        const checkHLSStream = async () => {
+          try {
+            console.log('Checking HLS stream at:', hlsStreamUrl);
+            const response = await fetch(hlsStreamUrl);
+            if (response.ok) {
+              console.log('HLS stream is available');
+              if (videoRef.current) {
+                if (Hls.isSupported()) {
+                  const hls = new Hls({ 
+                    enableWorker: true, 
+                    lowLatencyMode: true,
+                    debug: true,
+                    maxBufferLength: 30,
+                    maxMaxBufferLength: 60,
+                    maxBufferSize: 60 * 1000 * 1000,
+                    maxBufferHole: 0.5,
+                    backBufferLength: 90
+                  });
+                  hls.loadSource(hlsStreamUrl);
+                  hls.attachMedia(videoRef.current);
+                  hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                    console.log('HLS manifest parsed for preview');
+                    videoRef.current.play();
+                  });
+                  hls.on(Hls.Events.ERROR, (event, data) => {
+                    console.error('HLS error in preview:', data);
+                    if (data.fatal) {
+                      hls.destroy();
+                      setIsStreaming(false);
+                    }
+                  });
+                } else if (videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
+                  videoRef.current.src = hlsStreamUrl;
+                  videoRef.current.play();
+                }
+              }
+            } else {
+              console.log('HLS stream not yet available, retrying in 2 seconds...');
+              setTimeout(checkHLSStream, 2000);
+            }
+          } catch (err) {
+            console.log('Error checking HLS stream:', err);
+            setTimeout(checkHLSStream, 2000);
+          }
+        };
+        
+        checkHLSStream();
       }
-    });
+    } catch (error) {
+      console.error('Error starting stream:', error);
+      alert('Failed to start streaming: ' + error.message);
+      setIsStreaming(false);
+    }
   };
 
   const stopStreaming = async () => {
@@ -369,16 +558,27 @@ function Broadcaster({ roomId }) {
         videoRef.current.srcObject = null;
         streamRef.current = null;
       }
-      if (peerConnectionRef.current) {
-        peerConnectionRef.current.close();
-        peerConnectionRef.current = null;
-      }
-      // Clear all pending candidates
+
+      // Close all peer connections
+      peerConnectionsRef.current.forEach((pc) => {
+        console.log('Closing peer connection');
+        pc.close();
+      });
+      peerConnectionsRef.current.clear();
       pendingCandidatesRef.current.clear();
       
       setIsStreaming(false);
       console.log('Emitting stop_streaming');
-      socketRef.current.emit('stop_streaming', roomId);
+      
+      await new Promise((resolve, reject) => {
+        socket.emit('stop_streaming', roomId, (response) => {
+          if (response?.success) {
+            resolve(response);
+          } else {
+            reject(new Error(response?.error || 'Failed to stop streaming'));
+          }
+        });
+      });
 
       try {
         const response = await fetch('http://localhost:5000/delete-room', {
@@ -388,7 +588,6 @@ function Broadcaster({ roomId }) {
         });
         if (response.ok) {
           console.log(`Room ${roomId} deleted`);
-          // Redirect to root page
           window.location.href = '/';
         } else {
           console.error('Failed to delete room:', await response.text());
@@ -396,8 +595,8 @@ function Broadcaster({ roomId }) {
       } catch (err) {
         console.error('Error deleting room:', err);
       }
-    } catch (err) {
-      console.error('Error stopping stream:', err);
+    } catch (error) {
+      console.error('Error stopping stream:', error);
     }
   };
 
@@ -453,24 +652,104 @@ function Broadcaster({ roomId }) {
       if (peerConnectionRef.current) {
         peerConnectionRef.current.close();
       }
-      socketRef.current.off('webrtc_answer');
-      socketRef.current.off('webrtc_ice_candidate');
+      if (socket) {
+        try {
+          socket.off('webrtc_answer');
+          socket.off('webrtc_ice_candidate');
+        } catch (err) {
+          console.warn('Error during socket cleanup:', err);
+        }
+      }
     };
-  }, []);
+  }, [socket]);
 
-  // Add socket event listeners for OBS stream status
+  // Update the OBS stream status effect
   useEffect(() => {
-    if (socketRef.current) {
-      socketRef.current.on('stream_status', (data) => {
-        console.log('Stream status update:', data);
-        if (data.isActive) {
-          setIsStreaming(true);
-        } else {
-          setIsStreaming(false);
+    if (!socket) return;
+
+    const cleanup = () => {
+      if (socket) {
+        try {
+          socket.off('stream_status');
+        } catch (err) {
+          console.warn('Error during socket cleanup:', err);
+        }
+      }
+    };
+
+    socket.on('stream_status', (data) => {
+      console.log('Stream status update:', data);
+      if (data.isActive) {
+        setIsStreaming(true);
+      } else {
+        setIsStreaming(false);
+      }
+    });
+
+    return cleanup;
+  }, [socket]);
+
+  // Add health monitoring for peer connections
+  useEffect(() => {
+    if (!isStreaming || streamSource !== 'webcam') {
+      return;
+    }
+
+    const healthCheckInterval = setInterval(() => {
+      const connections = Array.from(peerConnectionsRef.current.entries());
+      console.log(`Health check - Managing ${connections.length} peer connections`);
+      
+      connections.forEach(([viewerId, pc]) => {
+        const connectionState = pc.connectionState;
+        const iceState = pc.iceConnectionState;
+        
+        console.log(`Viewer ${viewerId} - Connection: ${connectionState}, ICE: ${iceState}`);
+        
+        // Check if tracks are still being sent
+        const senders = pc.getSenders();
+        const activeSenders = senders.filter(sender => 
+          sender.track && sender.track.readyState === 'live'
+        );
+        
+        console.log(`Viewer ${viewerId} - Active senders: ${activeSenders.length}/${senders.length}`);
+        
+        // If connection is failed or closed, clean it up
+        if (connectionState === 'failed' || connectionState === 'closed') {
+          console.log(`Cleaning up failed connection for viewer ${viewerId}`);
+          pc.close();
+          peerConnectionsRef.current.delete(viewerId);
+          pendingCandidatesRef.current.delete(viewerId);
+        }
+        
+        // If we have no active senders but connection is good, there might be an issue
+        if ((connectionState === 'connected' || iceState === 'connected') && activeSenders.length === 0) {
+          console.warn(`No active senders for viewer ${viewerId} despite good connection`);
         }
       });
-    }
-  }, []);
+    }, 10000); // Check every 10 seconds
+
+    return () => {
+      clearInterval(healthCheckInterval);
+    };
+  }, [isStreaming, streamSource]);
+
+  if (socketError) {
+    return (
+      <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative" role="alert">
+        <strong className="font-bold">Error: </strong>
+        <span className="block sm:inline">{socketError}</span>
+      </div>
+    );
+  }
+
+  if (!isConnected) {
+    return (
+      <div className="flex items-center justify-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500"></div>
+        <span className="ml-3">Connecting...</span>
+      </div>
+    );
+  }
 
   return (
     <div className="mt-4 w-full max-w-md">
