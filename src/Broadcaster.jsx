@@ -388,6 +388,8 @@ function Broadcaster({ roomId }) {
         });
         if (response.ok) {
           console.log(`Room ${roomId} deleted`);
+          // Redirect to root page
+          window.location.href = '/';
         } else {
           console.error('Failed to delete room:', await response.text());
         }
