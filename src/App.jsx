@@ -8,7 +8,7 @@ import io from 'socket.io-client';
 function App() {
   const [role, setRole] = useState(new URLSearchParams(window.location.search).get('role') || 'viewer');
   const [roomId, setRoomId] = useState(new URLSearchParams(window.location.search).get('room') || '');
-  const streamUrl = `http://localhost:8080/hls/stream_${roomId}.m3u8`; // Dynamic URL based on roomId for stream key
+  const streamUrl = `${process.env.REACT_APP_HLS_STREAM_URL}/stream_${roomId}.m3u8`; // Dynamic URL based on roomId for stream key
   const [userId, setUserId] = useState(`user_${Math.random().toString(36).substr(2, 9)}`);
   const [username, setUsername] = useState('');
   const [isRoomJoined, setIsRoomJoined] = useState(false);
@@ -17,7 +17,7 @@ function App() {
 
   // Initialize socket once when component mounts
   useEffect(() => {
-    const newSocket = io('http://localhost:5000', {
+    const newSocket = io(process.env.REACT_APP_BACKEND_URL, {
       autoConnect: true,
       forceNew: true,
       transports: ['websocket', 'polling']
@@ -105,7 +105,7 @@ function App() {
     }
     
     try {
-      const response = await fetch('http://localhost:5000/create-room', {
+      const response = await fetch(`${process.env.REACT_APP_BACKEND_URL}/create-room`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -139,7 +139,7 @@ function App() {
 
     try {
       console.log('Checking room status for:', joinRoomId);
-      const roomResponse = await fetch(`http://localhost:5000/room/${joinRoomId}`);
+      const roomResponse = await fetch(`${process.env.REACT_APP_BACKEND_URL}/room/${joinRoomId}`);
       const roomData = await roomResponse.json();
       console.log('Room data received:', roomData);
 

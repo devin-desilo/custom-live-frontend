@@ -8,7 +8,7 @@ function Chat({ roomId, userId, username, socket }) {
   const chatContainerRef = useRef(null);
 
   // Use the socket passed from parent or create a new one
-  const socketRef = useRef(socket || io('http://localhost:5000', {
+  const socketRef = useRef(socket || io(process.env.REACT_APP_SOCKET_URL, {
     query: { roomId },
     autoConnect: true
   }));

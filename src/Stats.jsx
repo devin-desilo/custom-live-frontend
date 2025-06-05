@@ -13,7 +13,7 @@ function Stats({ roomId, socket }) {
   });
 
   const [startTime] = useState(Date.now());
-  const socketRef = React.useRef(socket || io('http://localhost:5000'));
+  const socketRef = React.useRef(socket || io(process.env.REACT_APP_SOCKET_URL));
 
   useEffect(() => {
     const currentSocket = socketRef.current;

@@ -15,7 +15,7 @@ function Broadcaster({ roomId, socket }) {
   const [selectedCamera, setSelectedCamera] = useState('');
   const [isConnected, setIsConnected] = useState(false);
   const [socketError, setSocketError] = useState(null);
-  const hlsStreamUrl = `http://localhost:8020/live/stream_${roomId}/index.m3u8`;
+  const hlsStreamUrl = `${process.env.REACT_APP_HLS_PREVIEW_URL}/stream_${roomId}/index.m3u8`;
 
   // Use the socket passed from App component
   useEffect(() => {
@@ -91,19 +91,43 @@ function Broadcaster({ roomId, socket }) {
         createPeerConnection(data.viewerId).catch(error => {
           console.error('Error creating peer connection:', error);
         });
+      } else {
+        console.log('Not creating peer connection - conditions not met');
+        console.log('isStreaming:', isStreaming, 'streamSource:', streamSource);
       }
     });
 
     socket.on('viewer_ready', (data) => {
       console.log('Viewer ready event received:', data);
+      console.log('Current streaming state:', { isStreaming, streamSource });
+      console.log('Available stream tracks:', streamRef.current ? streamRef.current.getTracks().length : 0);
+      
       if (isStreaming && streamSource === 'webcam') {
         console.log('Creating peer connection for ready viewer:', data.viewerId);
-        // Handle viewer ready synchronously
-        createPeerConnection(data.viewerId).catch(error => {
-          console.error('Error creating peer connection:', error);
-        });
+        
+        // If viewer requires keyframe, force one before creating connection
+        if (data.requiresKeyframe && streamRef.current) {
+          console.log('Forcing keyframe for new viewer:', data.viewerId);
+          try {
+            const videoTrack = streamRef.current.getVideoTracks()[0];
+            if (videoTrack && typeof videoTrack.requestFrame === 'function') {
+              videoTrack.requestFrame();
+            }
+          } catch (err) {
+            console.warn('Could not request keyframe:', err);
+          }
+        }
+        
+        // Add small delay to ensure keyframe is generated
+        setTimeout(() => {
+          createPeerConnection(data.viewerId).catch(error => {
+            console.error('Error creating peer connection:', error);
+          });
+        }, 500);
       } else {
-        console.log('Cannot create peer connection - streaming:', isStreaming, 'source:', streamSource);
+        console.log('Cannot create peer connection - conditions not met');
+        console.log('isStreaming:', isStreaming, 'streamSource:', streamSource);
+        console.log('Stream available:', streamRef.current ? 'Yes' : 'No');
       }
     });
 
@@ -378,7 +402,7 @@ function Broadcaster({ roomId, socket }) {
         }
       };
 
-      // Create and send offer
+      // Create and send offer with better error handling
       console.log('Creating offer for viewer:', viewerId);
       const offer = await peerConnection.createOffer({
         offerToReceiveAudio: false,
@@ -389,12 +413,43 @@ function Broadcaster({ roomId, socket }) {
       await peerConnection.setLocalDescription(offer);
       console.log('Set local description for viewer:', viewerId, 'state:', peerConnection.signalingState);
       
+      // Validate that we have tracks in the offer
+      const sdpLines = offer.sdp.split('\n');
+      const hasVideo = sdpLines.some(line => line.includes('m=video'));
+      const hasAudio = sdpLines.some(line => line.includes('m=audio'));
+      console.log(`Offer validation for viewer ${viewerId}: hasVideo=${hasVideo}, hasAudio=${hasAudio}`);
+      
+      if (!hasVideo && !hasAudio) {
+        throw new Error('No media tracks found in offer');
+      }
+      
       console.log('Sending offer to viewer:', viewerId);
       socket.emit('webrtc_offer', {
         roomId,
         viewerId,
         offer: peerConnection.localDescription
       });
+
+      // Set up connection timeout
+      const connectionTimeout = setTimeout(() => {
+        if (peerConnection.connectionState === 'connecting' || peerConnection.connectionState === 'new') {
+          console.log(`Connection timeout for viewer ${viewerId}, closing connection`);
+          peerConnection.close();
+          peerConnectionsRef.current.delete(viewerId);
+          pendingCandidatesRef.current.delete(viewerId);
+        }
+      }, 15000); // 15 second timeout
+
+      // Clear timeout when connection succeeds
+      const originalOnConnectionStateChange = peerConnection.onconnectionstatechange;
+      peerConnection.onconnectionstatechange = () => {
+        if (peerConnection.connectionState === 'connected') {
+          clearTimeout(connectionTimeout);
+        }
+        if (originalOnConnectionStateChange) {
+          originalOnConnectionStateChange.call();
+        }
+      };
 
       console.log('Peer connection setup complete for viewer:', viewerId);
     } catch (error) {
@@ -466,7 +521,7 @@ function Broadcaster({ roomId, socket }) {
         // Create peer connections for existing viewers
         try {
           console.log('Checking for existing viewers');
-          const roomData = await fetch(`http://localhost:5000/room/${roomId}`).then(res => res.json());
+          const roomData = await fetch(`${process.env.REACT_APP_BACKEND_URL}/room/${roomId}`).then(res => res.json());
           if (roomData.viewers && roomData.viewers.length > 0) {
             console.log('Creating peer connections for existing viewers:', roomData.viewers);
             for (const viewerId of roomData.viewers) {
@@ -581,7 +636,7 @@ function Broadcaster({ roomId, socket }) {
       });
 
       try {
-        const response = await fetch('http://localhost:5000/delete-room', {
+        const response = await fetch(`${process.env.REACT_APP_BACKEND_URL}/delete-room`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ roomId }),
@@ -823,7 +878,7 @@ function Broadcaster({ roomId, socket }) {
         {streamSource === 'obs' && (
           <div className="mt-2 text-sm text-gray-700">
             <p>
-              <strong>RTMP Server:</strong> rtmp://localhost:1935/live
+              <strong>RTMP Server:</strong> {process.env.REACT_APP_RTMP_SERVER}
             </p>
             <p>
               <strong>Stream Key:</strong> stream_{roomId}
